@@ -1,4 +1,5 @@
 import express, { type NextFunction, type Request, type Response } from "express";
+import { randomInt } from "node:crypto";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 
 import { hashPassword, signAccessToken, verifyAccessToken, verifyPassword } from "./security.js";
@@ -23,8 +24,13 @@ type SessionRow = RowDataPacket & {
   startedAt: Date | null;
   endsAt: Date | null;
   endedAt: Date | null;
+  nearbyMajor: number | null;
+  nearbyMinor: number | null;
+  nearbyVerifiedAt: Date | null;
+  nearbyExpiresAt: Date | null;
 };
 
+const ICOMMIT_BEACON_UUID = "725AF4F9-CC16-4A3C-8C51-205FC9A13B17";
 let pool: Pool | undefined;
 let schemaPromise: Promise<void> | undefined;
 
@@ -104,6 +110,18 @@ async function ensureSchema(): Promise<void> {
         CONSTRAINT fk_ack_session FOREIGN KEY (sessionId) REFERENCES commitment_sessions(id) ON DELETE CASCADE,
         CONSTRAINT fk_ack_user FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
       ) ENGINE=InnoDB`);
+      for (const migration of [
+        "ALTER TABLE commitment_sessions ADD COLUMN nearbyMajor SMALLINT UNSIGNED NULL",
+        "ALTER TABLE commitment_sessions ADD COLUMN nearbyMinor SMALLINT UNSIGNED NULL",
+        "ALTER TABLE commitment_sessions ADD COLUMN nearbyVerifiedAt DATETIME NULL",
+        "ALTER TABLE commitment_sessions ADD COLUMN nearbyExpiresAt DATETIME NULL",
+      ]) {
+        try {
+          await database.query(migration);
+        } catch (error) {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ER_DUP_FIELDNAME") throw error;
+        }
+      }
     })();
   }
   return schemaPromise;
@@ -172,7 +190,7 @@ async function getActiveRelationship(connection: PoolConnection, userId: number)
 
 async function getOwnedSession(connection: PoolConnection, userId: number, sessionId: number): Promise<SessionRow | undefined> {
   const [rows] = await connection.query<SessionRow[]>(
-    `SELECT s.id, s.relationshipId, s.createdByUserId, s.durationSeconds, s.status, s.startedAt, s.endsAt, s.endedAt
+    `SELECT s.id, s.relationshipId, s.createdByUserId, s.durationSeconds, s.status, s.startedAt, s.endsAt, s.endedAt, s.nearbyMajor, s.nearbyMinor, s.nearbyVerifiedAt, s.nearbyExpiresAt
      FROM commitment_sessions s
      JOIN relationships r ON r.id = s.relationshipId
      WHERE s.id = ? AND r.status = 'active' AND (r.userAId = ? OR r.userBId = ?) LIMIT 1`,
@@ -185,7 +203,7 @@ function userResponse(user: UserRow) {
   return { id: user.id, email: user.email, displayName: user.displayName };
 }
 
-function sessionResponse(session: SessionRow) {
+function sessionResponse(session: SessionRow, userId?: number) {
   return {
     id: session.id,
     relationshipId: session.relationshipId,
@@ -194,9 +212,25 @@ function sessionResponse(session: SessionRow) {
     startedAt: session.startedAt,
     endsAt: session.endsAt,
     endedAt: session.endedAt,
+    nearby: session.status === "pending" && session.nearbyExpiresAt ? {
+      mode: session.createdByUserId === userId ? "advertise" : "scan",
+      ...(session.createdByUserId === userId && session.nearbyMajor !== null && session.nearbyMinor !== null ? { major: session.nearbyMajor, minor: session.nearbyMinor } : {}),
+      expiresAt: session.nearbyExpiresAt,
+      verifiedAt: session.nearbyVerifiedAt,
+      beaconUuid: ICOMMIT_BEACON_UUID,
+    } : null,
   };
 }
 
+async function activateWhenReady(connection: PoolConnection, sessionId: number): Promise<void> {
+  const [ackRows] = await connection.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM session_acknowledgements WHERE sessionId = ?", [sessionId]);
+  if (Number(ackRows[0].count) >= 2) {
+    await connection.execute(
+      "UPDATE commitment_sessions SET status = 'active', startedAt = NOW(), endsAt = DATE_ADD(NOW(), INTERVAL durationSeconds SECOND) WHERE id = ? AND status = 'pending' AND nearbyVerifiedAt IS NOT NULL",
+      [sessionId],
+    );
+  }
+}
 function error(response: Response, status: number, code: string, message: string) {
   return response.status(status).json({ error: { code, message } });
 }
@@ -315,14 +349,14 @@ app.get("/state", requireAuth, async (request: AuthenticatedRequest, response) =
         [relationship.id],
       );
       const [sessionRows] = await connection.query<SessionRow[]>(
-        `SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt
+        `SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt, nearbyMajor, nearbyMinor, nearbyVerifiedAt, nearbyExpiresAt
          FROM commitment_sessions WHERE relationshipId = ? AND status IN ('pending', 'active') ORDER BY id DESC LIMIT 1`,
         [relationship.id],
       );
       return {
         partner: partnerRows[0] ? userResponse(partnerRows[0]) : null,
         relationship: { id: relationship.id },
-        session: sessionRows[0] ? sessionResponse(sessionRows[0]) : null,
+        session: sessionRows[0] ? sessionResponse(sessionRows[0], userId) : null,
       };
     });
     return response.status(200).json(state);
@@ -419,18 +453,18 @@ app.post("/sessions", requireAuth, async (request: AuthenticatedRequest, respons
       );
       if (activeRows[0]) return null;
       const [insert] = await connection.execute<mysql.ResultSetHeader>(
-        "INSERT INTO commitment_sessions (relationshipId, createdByUserId, durationSeconds) VALUES (?, ?, ?)",
-        [relationship.id, userId, durationSeconds],
+        "INSERT INTO commitment_sessions (relationshipId, createdByUserId, durationSeconds, nearbyMajor, nearbyMinor, nearbyExpiresAt) VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 2 MINUTE))",
+        [relationship.id, userId, durationSeconds, randomInt(1, 65_536), randomInt(1, 65_536)],
       );
       const [rows] = await connection.query<SessionRow[]>(
-        "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt FROM commitment_sessions WHERE id = ?",
+        "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt, nearbyMajor, nearbyMinor, nearbyVerifiedAt, nearbyExpiresAt FROM commitment_sessions WHERE id = ?",
         [insert.insertId],
       );
       return rows[0];
     });
     if (session === undefined) return error(response, 409, "NOT_PAIRED", "Pair with a consenting partner before starting a commitment.");
     if (session === null) return error(response, 409, "SESSION_IN_PROGRESS", "Finish the current commitment before starting another.");
-    return response.status(201).json({ session: sessionResponse(session) });
+    return response.status(201).json({ session: sessionResponse(session, userId) });
   } catch {
     return error(response, 503, "DATABASE_UNAVAILABLE", "Unable to create the commitment session.");
   }
@@ -450,15 +484,9 @@ app.post("/sessions/:id/acknowledge", requireAuth, async (request: Authenticated
           return undefined;
         }
         await connection.execute("INSERT IGNORE INTO session_acknowledgements (sessionId, userId) VALUES (?, ?)", [sessionId, userId]);
-        const [ackRows] = await connection.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM session_acknowledgements WHERE sessionId = ?", [sessionId]);
-        if (Number(ackRows[0].count) >= 2) {
-          await connection.execute(
-            "UPDATE commitment_sessions SET status = 'active', startedAt = NOW(), endsAt = DATE_ADD(NOW(), INTERVAL durationSeconds SECOND) WHERE id = ? AND status = 'pending'",
-            [sessionId],
-          );
-        }
+        await activateWhenReady(connection, sessionId);
         const [rows] = await connection.query<SessionRow[]>(
-          "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt FROM commitment_sessions WHERE id = ?",
+          "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt, nearbyMajor, nearbyMinor, nearbyVerifiedAt, nearbyExpiresAt FROM commitment_sessions WHERE id = ?",
           [sessionId],
         );
         await connection.commit();
@@ -469,12 +497,51 @@ app.post("/sessions/:id/acknowledge", requireAuth, async (request: Authenticated
       }
     });
     if (!session) return error(response, 404, "SESSION_NOT_PENDING", "This pending session is not available to acknowledge.");
-    return response.status(200).json({ session: sessionResponse(session) });
+    return response.status(200).json({ session: sessionResponse(session, userId) });
   } catch {
     return error(response, 503, "DATABASE_UNAVAILABLE", "Unable to acknowledge the commitment session.");
   }
 });
 
+app.post("/sessions/:id/nearby/confirm", requireAuth, async (request: AuthenticatedRequest, response) => {
+  const sessionId = Number(request.params.id);
+  const userId = request.userId!;
+  const major = Number(request.body?.major);
+  const minor = Number(request.body?.minor);
+  if (!Number.isInteger(sessionId) || sessionId <= 0 || !Number.isInteger(major) || !Number.isInteger(minor)) {
+    return error(response, 400, "INVALID_INPUT", "Use the Bluetooth proof found during nearby verification.");
+  }
+  try {
+    const session = await withConnection(async (connection) => {
+      await connection.beginTransaction();
+      try {
+        const ownedSession = await getOwnedSession(connection, userId, sessionId);
+        const canVerify = ownedSession && ownedSession.status === "pending" && ownedSession.createdByUserId !== userId
+          && ownedSession.nearbyExpiresAt && ownedSession.nearbyExpiresAt > new Date()
+          && ownedSession.nearbyMajor === major && ownedSession.nearbyMinor === minor;
+        if (!canVerify) {
+          await connection.rollback();
+          return undefined;
+        }
+        await connection.execute("UPDATE commitment_sessions SET nearbyVerifiedAt = NOW() WHERE id = ? AND nearbyVerifiedAt IS NULL", [sessionId]);
+        await activateWhenReady(connection, sessionId);
+        const [rows] = await connection.query<SessionRow[]>(
+          "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt, nearbyMajor, nearbyMinor, nearbyVerifiedAt, nearbyExpiresAt FROM commitment_sessions WHERE id = ?",
+          [sessionId],
+        );
+        await connection.commit();
+        return rows[0];
+      } catch (failure) {
+        await connection.rollback();
+        throw failure;
+      }
+    });
+    if (!session) return error(response, 409, "NEARBY_NOT_VERIFIED", "The temporary nearby signal was not found. Keep both phones close and begin a new commitment if the proof expired.");
+    return response.status(200).json({ session: sessionResponse(session, userId) });
+  } catch {
+    return error(response, 503, "DATABASE_UNAVAILABLE", "Unable to confirm the nearby signal.");
+  }
+});
 app.post("/sessions/:id/end", requireAuth, async (request: AuthenticatedRequest, response) => {
   const sessionId = Number(request.params.id);
   const userId = request.userId!;
@@ -485,13 +552,13 @@ app.post("/sessions/:id/end", requireAuth, async (request: AuthenticatedRequest,
       if (!ownedSession || !["pending", "active"].includes(ownedSession.status)) return undefined;
       await connection.execute("UPDATE commitment_sessions SET status = 'ended', endedAt = NOW(), endedByUserId = ? WHERE id = ?", [userId, sessionId]);
       const [rows] = await connection.query<SessionRow[]>(
-        "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt FROM commitment_sessions WHERE id = ?",
+        "SELECT id, relationshipId, createdByUserId, durationSeconds, status, startedAt, endsAt, endedAt, nearbyMajor, nearbyMinor, nearbyVerifiedAt, nearbyExpiresAt FROM commitment_sessions WHERE id = ?",
         [sessionId],
       );
       return rows[0];
     });
     if (!session) return error(response, 404, "SESSION_NOT_ACTIVE", "This commitment session is not available to end.");
-    return response.status(200).json({ session: sessionResponse(session) });
+    return response.status(200).json({ session: sessionResponse(session, userId) });
   } catch {
     return error(response, 503, "DATABASE_UNAVAILABLE", "Unable to end the commitment session.");
   }
